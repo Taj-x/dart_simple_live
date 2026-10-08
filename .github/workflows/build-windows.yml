@@ -1,0 +1,42 @@
+name: Build Windows ZIP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.38.x"
+          channel: stable
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Install dependencies
+        working-directory: simple_live_app
+        run: flutter pub get
+
+      - name: Build Windows release
+        working-directory: simple_live_app
+        run: flutter build windows --release
+
+      - name: Upload Windows app
+        uses: actions/upload-artifact@v4
+        with:
+          name: SimpleLive-Windows-x64
+          path: simple_live_app/build/windows/x64/runner/Release/
+          if-no-files-found: error
+          retention-days: 14
