@@ -74,6 +74,72 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
 
   Map<String, String>? playHeaders;
 
+  bool _renewingDouyuStream = false;
+  bool _roomClosed = false;
+  int _playRequestGeneration = 0;
+  DateTime? _lastDouyuRenewal;
+
+  // Renew signed URLs without resetting the selected quality or danmaku.
+  Future<bool> _renewDouyuStream() async {
+    if (_roomClosed || !Platform.isWindows || site.id != "douyu") {
+      return false;
+    }
+    if (_renewingDouyuStream) return true;
+    if (currentQuality < 0 || currentQuality >= qualites.length) return false;
+    final now = DateTime.now();
+    if (_lastDouyuRenewal != null &&
+        now.difference(_lastDouyuRenewal!) < const Duration(seconds: 30)) {
+      return false;
+    }
+
+    final generation = _playRequestGeneration;
+    final selectedQuality = currentQuality;
+    final qualityName = qualites[selectedQuality].quality;
+    final selectedLine = currentLineIndex;
+    _renewingDouyuStream = true;
+    _lastDouyuRenewal = now;
+    bool isCurrent() => !_roomClosed &&
+        generation == _playRequestGeneration &&
+        selectedQuality == currentQuality;
+    try {
+      Log.d("斗鱼播放中断，重新获取 $qualityName 的播放地址");
+      final freshDetail = await site.liveSite.getRoomDetail(roomId: roomId);
+      if (!isCurrent()) return true;
+      if (!freshDetail.status || freshDetail.isRecord) return false;
+      final freshQualities =
+          await site.liveSite.getPlayQualites(detail: freshDetail);
+      if (!isCurrent()) return true;
+      final freshIndex =
+          freshQualities.indexWhere((quality) => quality.quality == qualityName);
+      if (freshIndex < 0) return false;
+      final freshUrls = await site.liveSite.getPlayUrls(
+        detail: freshDetail,
+        quality: freshQualities[freshIndex],
+      );
+      if (!isCurrent()) return true;
+      if (freshUrls.urls.isEmpty) return false;
+      detail.value = freshDetail;
+      qualites.value = freshQualities;
+      currentQuality = freshIndex;
+      currentQualityInfo.value = qualityName;
+      playUrls.value = freshUrls.urls;
+      playHeaders = freshUrls.headers;
+      currentLineIndex = selectedLine >= 0 && selectedLine < playUrls.length
+          ? selectedLine
+          : 0;
+      liveStatus.value = true;
+      mediaErrorRetryCount = 0;
+      await initPlaylist();
+      Log.d("斗鱼已重新打开 $qualityName，等待播放器恢复");
+      return true;
+    } catch (e) {
+      Log.d("斗鱼播放地址更新失败: $e");
+      return !isCurrent();
+    } finally {
+      _renewingDouyuStream = false;
+    }
+  }
+
   /// 当前线路
   var currentLineIndex = -1;
   var currentLineInfo = "".obs;
@@ -176,6 +242,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   // 弹窗逻辑
 
   void refreshRoom() {
+    _playRequestGeneration++;
     //messages.clear();
     superChats.clear();
     liveDanmaku.stop();
@@ -390,6 +457,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   }
 
   void getPlayUrl() async {
+    _playRequestGeneration++;
     playUrls.clear();
     currentQualityInfo.value = qualites[currentQuality].quality;
     currentLineInfo.value = "";
@@ -410,13 +478,14 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   }
 
   void changePlayLine(int index) {
+    _playRequestGeneration++;
     currentLineIndex = index;
     //重置错误次数
     mediaErrorRetryCount = 0;
     setPlayer();
   }
 
-  void initPlaylist() async {
+  Future<void> initPlaylist() async {
     currentLineInfo.value = "线路${currentLineIndex + 1}";
     errorMsg.value = "";
 
@@ -431,7 +500,7 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     // 初始化播放器并设置 ao 参数
     await initializePlayer();
 
-    await player.open(Playlist(mediaList));
+    await player.open(Playlist(mediaList, index: currentLineIndex));
   }
 
   void setPlayer() async {
@@ -443,6 +512,9 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
 
   @override
   void mediaEnd() async {
+    if (_roomClosed) return;
+    if (await _renewDouyuStream()) return;
+    if (_roomClosed) return;
     super.mediaEnd();
     if (mediaErrorRetryCount < 2) {
       Log.d("播放结束，尝试第${mediaErrorRetryCount + 1}次刷新");
@@ -470,6 +542,10 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   int mediaErrorRetryCount = 0;
   @override
   void mediaError(String error) async {
+    if (_roomClosed) return;
+    Log.d("播放错误: $error");
+    if (await _renewDouyuStream()) return;
+    if (_roomClosed) return;
     super.mediaEnd();
     if (mediaErrorRetryCount < 2) {
       Log.d("播放失败，尝试第${mediaErrorRetryCount + 1}次刷新");
@@ -1053,6 +1129,8 @@ ${error?.stackTrace}''');
 
   @override
   void onClose() {
+    _roomClosed = true;
+    _playRequestGeneration++;
     WidgetsBinding.instance.removeObserver(this);
     scrollController.removeListener(scrollListener);
     autoExitTimer?.cancel();
