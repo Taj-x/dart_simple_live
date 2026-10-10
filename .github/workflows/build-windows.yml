@@ -29,6 +29,14 @@ jobs:
         working-directory: simple_live_app
         run: flutter pub get
 
+      - name: Test FLV seamless relay
+        working-directory: simple_live_app
+        run: dart tool/flv_lease_relay_test.dart
+
+      - name: Analyze playback changes
+        working-directory: simple_live_app
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings lib/services/flv_lease_relay.dart lib/modules/live_room/live_room_controller.dart
+
       - name: Build Windows release
         working-directory: simple_live_app
         run: flutter build windows --release
