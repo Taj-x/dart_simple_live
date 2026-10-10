@@ -102,14 +102,18 @@ class FakeCdn {
 
   String get url => 'http://127.0.0.1:${server.port}/live.flv?expire=2';
   Future<void> handle(HttpRequest request) async {
-    opened++;
+    final connection = ++opened;
     final response = request.response;
     if (failFrom != null && opened >= failFrom!) {
       response.statusCode = 403;
       await response.close();
       return;
     }
-    final offset = opened > 1 ? timestampOffset : 0;
+    final offset = connection > 1 ? timestampOffset : 0;
+    // Model a newly opened CDN connection with a little less transport latency.
+    // Both still share one media timeline. If both generate and deliver the same
+    // keyframe in the same event-loop turn, test success depends on OS ordering.
+    final transportLead = connection * 80;
     outputs.add(response);
     response.bufferOutput = false;
     response.headers.contentType = ContentType('video', 'x-flv');
@@ -127,10 +131,10 @@ class FakeCdn {
         },
       ),
     );
-    var last = clock.elapsedMilliseconds ~/ 20 - 1;
+    var last = (clock.elapsedMilliseconds + transportLead) ~/ 20 - 1;
     try {
       while (!disconnected && !closed) {
-        final tick = clock.elapsedMilliseconds ~/ 20;
+        final tick = (clock.elapsedMilliseconds + transportLead) ~/ 20;
         while (last < tick) {
           last++;
           final time = last * 20 + offset;
@@ -142,7 +146,8 @@ class FakeCdn {
           }
           await response.flush();
         }
-        await Future<void>.delayed(const Duration(milliseconds: 5));
+        // Coarse polling also exercises Windows-like timer granularity.
+        await Future<void>.delayed(const Duration(milliseconds: 16));
       }
     } catch (_) {
     } finally {
@@ -196,7 +201,10 @@ Future<void> relayTest({
     var maxVideoGap = 0;
     var maxAudioGap = 0;
     var configs = 0;
-    final end = cdn.clock.elapsedMilliseconds + 3800;
+    // Wait for the behavior being tested, not two renewals inside an arbitrary
+    // 3.8-second wall-clock window. The timeout still fails broken renewal.
+    final start = cdn.clock.elapsedMilliseconds;
+    final end = start + 15000;
     while (cdn.clock.elapsedMilliseconds < end) {
       final packet = await reader.next();
       check(packet != null, 'Downstream disconnected');
@@ -216,6 +224,12 @@ Future<void> relayTest({
         }
         lastAudio = t.timestamp;
       }
+      final handovers = logs.where((s) => s.contains('关键帧续流完成')).length;
+      if (!failRenewal && !badTimeline && configs >= 3 && handovers >= 2) break;
+      if ((failRenewal || badTimeline) &&
+          logs.any((s) => s.contains('保留旧连接')) &&
+          cdn.clock.elapsedMilliseconds - start >= 2500)
+        break;
     }
     check(renewals >= 1, 'No renewal attempted');
     check(
@@ -226,7 +240,11 @@ Future<void> relayTest({
       check(configs == 1, 'Failed renewal changed downstream source');
       check(logs.any((s) => s.contains('保留旧连接')), 'No fallback logged');
     } else {
-      check(configs >= 3, 'Expected at least two handovers');
+      check(
+        configs >= 3,
+        'Expected at least two handovers; '
+        'renewals=$renewals, configs=$configs, logs=$logs',
+      );
       check(
         logs.where((s) => s.contains('关键帧续流完成')).length >= 2,
         'No seamless handovers',
